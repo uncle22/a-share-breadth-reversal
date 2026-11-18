@@ -165,7 +165,13 @@ def limit_threshold(code, name):
 
 
 def market_progress(now):
-    """A股交易时间进度 0..1（扣除午休）。"""
+    """A股交易时间进度 0..1（扣除午休）。
+
+    周末直接视为收盘后（1.0）——否则周末跑脚本会把「上一交易日的全天成交额」
+    按盘中进度折算，放大出一个虚假的「放量」。
+    """
+    if now.weekday() >= 5:
+        return 1.0
     t = now.hour * 60 + now.minute
     am_s, am_e = 9 * 60 + 30, 11 * 60 + 30
     pm_s, pm_e = 13 * 60, 15 * 60
@@ -372,9 +378,14 @@ def win_stats(hist, key, n):
 
 
 def full_day_avg(hist, n=5):
-    """只用「完整交易日」的记录算均值，盘中记录不计入基准。"""
+    """只用「完整的全天记录」算均值。
+
+    记录必须显式带 progress 且 >= 0.99；缺失 progress 的老记录视为未知，直接排除
+    （否则半天的成交量会被当成全天，放大出一个虚假的「放量」）。
+    """
     vals = [h.get("amount_yi") for h in hist
-            if (h.get("progress") if h.get("progress") is not None else 1.0) >= 0.99
+            if h.get("progress") is not None
+            and h.get("progress") >= 0.99
             and h.get("amount_yi")]
     if not vals:
         return None
@@ -383,11 +394,11 @@ def full_day_avg(hist, n=5):
 
 
 def trin_bucket(t):
-    """TRIN 分档（固定阈值版，不依赖历史）。"""
+    """TRIN 分档。注意：低 TRIN 在普跌行情里是「抱团」不是「强势」。"""
     if t is None:
         return ("n/a", "")
     if t < 0.5:
-        return ("极强", "资金高度集中，警惕抱团见顶")
+        return ("高度集中", "少数股吸走大部分资金；普跌时=抱团见顶，普涨时=资金坚决")
     if t < 0.8:
         return ("偏强", "资金偏向上涨股")
     if t <= 1.2:
@@ -662,6 +673,17 @@ def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
         w(f"  → {ex['final_reason']}")
         if fv == "等":
             w("  按「冲突则等」的纪律：今天不开新仓，等两边同向再动。")
+        ht = ex.get("hold_tech") or {}
+        if ht:
+            w("  持仓技术面（日线 MA）：")
+            for code, pair in ht.items():
+                v, d = pair
+                nm = next((x.get("name") for x in holdings if x.get("code") == code), code)
+                mark = {"多": "🟢", "空": "🔴", "中": "⚪"}.get(v, "⚪")
+                f2 = lambda x: "n/a" if x is None else f"{x:.3f}"
+                w(f"    {mark} {nm:<6} {v}   现价 {f2(d.get('px'))} | "
+                  f"MA5 {f2(d.get('ma5'))} / MA10 {f2(d.get('ma10'))} / "
+                  f"MA20 {f2(d.get('ma20'))}")
         w("")
 
     tr = ex.get("trend") or {}
@@ -1017,8 +1039,11 @@ def main():
     ind = compute_breadth(rows)
 
     hist = load_history()
-    sample_n = len(hist)
-    total, verdict, tag, items, amount_mult, streak = score_all(ind, hist, progress)
+    # 连续性必须和「上一个交易日」比，不能和「今天早些时候的快照」比
+    hist_prev = [h for h in hist if h.get("date") != today]
+    sample_n = len(hist_prev)
+    total, verdict, tag, items, amount_mult, streak = score_all(
+        ind, hist_prev, progress)
 
     # 报价
     indexes = fetch_quotes([c for c, _ in INDEXES])
@@ -1054,11 +1079,13 @@ def main():
         "score": total, "verdict": verdict,
     }
 
-    # 同一天重跑则覆盖
+    # 同一天重跑则覆盖；周末不写入（数据是上一交易日的，重复写会污染历史）
     hist = [h for h in hist if h.get("date") != today]
-    hist.append(rec)
+    if now.weekday() < 5:
+        hist.append(rec)
     hist.sort(key=lambda h: h.get("date", ""))
-    save_history(hist)
+    if now.weekday() < 5:
+        save_history(hist)
 
     # ---- 两票制（资金面 / 技术面）+ 趋势指标 ----
     trend = compute_trend(hist)
