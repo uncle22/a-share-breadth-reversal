@@ -1,0 +1,20 @@
+# 运行时产物，不入库
+data/*
+!data/holdings.example.json
+breadth-data/
+*.html
+!docs/*.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

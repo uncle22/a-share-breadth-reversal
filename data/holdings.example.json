@@ -1,0 +1,10 @@
+{
+  "_comment": "复制为 data/holdings.json 后改成本人的持仓。qty=0 只观察不计占比。改完持仓记得同步 cash。",
+  "cash": 0,
+  "list": [
+    { "code": "sh515880", "name": "通信ETF",    "qty": 0, "cost": 0.0 },
+    { "code": "sz159516", "name": "半导体设备", "qty": 0, "cost": 0.0 },
+    { "code": "sh601328", "name": "交通银行",   "qty": 0, "cost": 0.0 },
+    { "code": "sh512800", "name": "银行ETF",    "qty": 0, "cost": 0.0 }
+  ]
+}
