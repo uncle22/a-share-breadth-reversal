@@ -382,21 +382,81 @@ def full_day_avg(hist, n=5):
     return sum(vals) / len(vals)
 
 
+def trin_bucket(t):
+    """TRIN 分档（固定阈值版，不依赖历史）。"""
+    if t is None:
+        return ("n/a", "")
+    if t < 0.5:
+        return ("极强", "资金高度集中，警惕抱团见顶")
+    if t < 0.8:
+        return ("偏强", "资金偏向上涨股")
+    if t <= 1.2:
+        return ("中性", "资金分配正常")
+    if t <= 2.0:
+        return ("偏弱", "资金趋向下跌股")
+    return ("极弱", "恐慌性抛售，常伴短期反弹")
+
+
+def mcl_series(ad):
+    """逐日 MCL = EMA19(AD) − EMA39(AD)，前期样本不足处为 None。"""
+    out = []
+    for i in range(len(ad)):
+        sub = ad[:i + 1]
+        if len(sub) < 39:
+            out.append(None)
+            continue
+        e19, e39 = ema(sub, 19), ema(sub, 39)
+        out.append((e19 - e39) if (e19 is not None and e39 is not None) else None)
+    return out
+
+
+def detect_divergence(hist, kline_rows, lookback=20):
+    """指数 vs 涨家占比 的 20 日背离。
+
+    返回 (label, idx_chg_pct, up_ratio_chg_pct) 或 None。
+    """
+    if len(hist) <= lookback:
+        return None
+    px = {}
+    for d, c in (kline_rows or []):
+        px[d] = c
+    d_now = hist[-1].get("date")
+    d_then = hist[-lookback].get("date")
+    p_now, p_then = px.get(d_now), px.get(d_then)
+    ur_now = hist[-1].get("up_ratio")
+    ur_then = hist[-lookback].get("up_ratio")
+    if None in (p_now, p_then, ur_now, ur_then) or p_then == 0:
+        return None
+    idx_chg = (p_now / p_then - 1) * 100.0
+    ur_chg = (ur_now - ur_then) * 100.0
+    if idx_chg > 0 and ur_chg < 0:
+        return ("顶背离", idx_chg, ur_chg)
+    if idx_chg < 0 and ur_chg > 0:
+        return ("底背离", idx_chg, ur_chg)
+    return ("无背离", idx_chg, ur_chg)
+
+
 def compute_trend(hist):
-    """10 日 TRIN 均线 + MCL（McClellan Oscillator = EMA19(AD) − EMA39(AD)）。"""
+    """10 日 TRIN 均线 + TRIN 分档 + MCL（含分位）。"""
     trin = [h.get("trin_amt") for h in hist if h.get("trin_amt") is not None]
     trin_ma10 = (sum(trin[-10:]) / 10.0) if len(trin) >= 10 else None
+    trin_now = trin[-1] if trin else None
+    t_state, t_note = trin_bucket(trin_now)
 
     ad = []
     for h in hist:
         if h.get("up") is not None and h.get("down") is not None:
             ad.append(h["up"] - h["down"])
-    mcl = None
+    mcl, mcl_pct = None, None
     if len(ad) >= 40:
-        e19, e39 = ema(ad, 19), ema(ad, 39)
-        if e19 is not None and e39 is not None:
-            mcl = e19 - e39
-    return {"trin_ma10": trin_ma10, "mcl": mcl,
+        ser = [x for x in mcl_series(ad) if x is not None]
+        if ser:
+            mcl = ser[-1]
+            if len(ser) >= 20:
+                mcl_pct = 100.0 * sum(1 for x in ser if x < mcl) / len(ser)
+    return {"trin_ma10": trin_ma10, "trin_now": trin_now,
+            "trin_state": t_state, "trin_note": t_note,
+            "mcl": mcl, "mcl_pct": mcl_pct,
             "trin_n": len(trin), "ad_n": len(ad)}
 
 
@@ -605,20 +665,37 @@ def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
         w("")
 
     tr = ex.get("trend") or {}
-    if tr:
-        w("【七、趋势指标】")
-        t10 = tr.get("trin_ma10")
-        if t10 is None:
-            w(f"  10日 TRIN  样本不足（需 10 天，现有 {tr.get('trin_n', 0)} 天）")
+    div = ex.get("divergence")
+    if tr or div:
+        w("【七、趋势与背离】")
+        if tr:
+            tn = tr.get("trin_now")
+            if tn is not None:
+                w(f"  TRIN 现值  {tn:.2f}  （{tr.get('trin_state', '')}："
+                  f"{tr.get('trin_note', '')}）")
+            t10 = tr.get("trin_ma10")
+            if t10 is None:
+                w(f"  10日 TRIN  样本不足（需 10 天，现有 {tr.get('trin_n', 0)} 天）")
+            else:
+                state = "超买" if t10 < 0.8 else ("超卖" if t10 > 1.2 else "中性")
+                w(f"  10日 TRIN  {t10:.2f}  （{state}；<0.8 超买 / >1.2 超卖）")
+            mcl = tr.get("mcl")
+            if mcl is None:
+                w(f"  MCL        样本不足（需 39 天，现有 {tr.get('ad_n', 0)} 天）")
+            else:
+                p = tr.get("mcl_pct")
+                extra = f"，自身分位 {p:.0f}%" if p is not None else ""
+                state = "广度强" if mcl > 0 else "广度弱"
+                w(f"  MCL        {mcl:+.1f}  （{state}{extra}）")
+        if div:
+            label, ic, uc = div
+            w(f"  20日背离   {label}（指数 {ic:+.1f}% / 涨家占比 {uc:+.1f}pp）")
+            if label == "顶背离":
+                w("             ⚠ 指数在涨但广度在退——典型顶部信号")
+            elif label == "底背离":
+                w("             ✅ 指数在跌但广度在改善——底部信号")
         else:
-            state = "超买" if t10 < 0.8 else ("超卖" if t10 > 1.2 else "中性")
-            w(f"  10日 TRIN  {t10:.2f}  （{state}；<0.8 超买 / >1.2 超卖）")
-        mcl = tr.get("mcl")
-        if mcl is None:
-            w(f"  MCL        样本不足（需 39 天，现有 {tr.get('ad_n', 0)} 天）")
-        else:
-            state = "广度强" if mcl > 0 else "广度弱"
-            w(f"  MCL        {mcl:+.1f}  （{state}；= EMA19−EMA39 的涨跌差）")
+            w("  20日背离   样本不足（需 21 天历史）")
         w("")
 
     w("【八、结论】")
@@ -789,30 +866,50 @@ def render_html(ind, hist, total, verdict, tag, items, amount_mult, streak,
               '等资金面与技术面同向再动。</div>')
         a('</div>')
 
-    # 趋势指标
+    # 趋势与背离
     tr = ex.get("trend") or {}
-    if tr:
-        a('<div class="panel"><h2>趋势指标</h2><table>')
-        t10 = tr.get("trin_ma10")
-        if t10 is None:
-            a(f'<tr><td>10日 TRIN</td><td class="num">样本不足</td>'
-              f'<td class="num" style="color:#64748b">需 10 天，现有 '
-              f'{tr.get("trin_n", 0)} 天</td></tr>')
+    div = ex.get("divergence")
+    if tr or div:
+        a('<div class="panel"><h2>趋势与背离</h2><table>')
+        if tr:
+            tn = tr.get("trin_now")
+            if tn is not None:
+                a(f'<tr><td>TRIN 现值</td><td class="num">{tn:.2f}</td>'
+                  f'<td class="num" style="color:#64748b">'
+                  f'{_esc(tr.get("trin_state",""))}：'
+                  f'{_esc(tr.get("trin_note",""))}</td></tr>')
+            t10 = tr.get("trin_ma10")
+            if t10 is None:
+                a(f'<tr><td>10日 TRIN</td><td class="num">样本不足</td>'
+                  f'<td class="num" style="color:#64748b">需 10 天，现有 '
+                  f'{tr.get("trin_n", 0)} 天</td></tr>')
+            else:
+                st = "超买" if t10 < 0.8 else ("超卖" if t10 > 1.2 else "中性")
+                a(f'<tr><td>10日 TRIN</td><td class="num">{t10:.2f}</td>'
+                  f'<td class="num" style="color:#64748b">{st}'
+                  f'（&lt;0.8 超买 / &gt;1.2 超卖）</td></tr>')
+            mcl = tr.get("mcl")
+            if mcl is None:
+                a(f'<tr><td>MCL</td><td class="num">样本不足</td>'
+                  f'<td class="num" style="color:#64748b">需 39 天，现有 '
+                  f'{tr.get("ad_n", 0)} 天</td></tr>')
+            else:
+                st = "广度强" if mcl > 0 else "广度弱"
+                p = tr.get("mcl_pct")
+                extra = f"，自身分位 {p:.0f}%" if p is not None else ""
+                a(f'<tr><td>MCL</td><td class="num">{mcl:+.1f}</td>'
+                  f'<td class="num" style="color:#64748b">{st}{extra}</td></tr>')
+        if div:
+            label, ic, uc = div
+            c = "#ef4444" if label == "顶背离" else (
+                "#22c55e" if label == "底背离" else "#64748b")
+            a(f'<tr><td>20日背离</td>'
+              f'<td class="num" style="color:{c}">{label}</td>'
+              f'<td class="num" style="color:#64748b">指数 {ic:+.1f}% / '
+              f'涨家 {uc:+.1f}pp</td></tr>')
         else:
-            st = "超买" if t10 < 0.8 else ("超卖" if t10 > 1.2 else "中性")
-            a(f'<tr><td>10日 TRIN</td><td class="num">{t10:.2f}</td>'
-              f'<td class="num" style="color:#64748b">{st}'
-              f'（&lt;0.8 超买 / &gt;1.2 超卖）</td></tr>')
-        mcl = tr.get("mcl")
-        if mcl is None:
-            a(f'<tr><td>MCL</td><td class="num">样本不足</td>'
-              f'<td class="num" style="color:#64748b">需 39 天，现有 '
-              f'{tr.get("ad_n", 0)} 天</td></tr>')
-        else:
-            st = "广度强" if mcl > 0 else "广度弱"
-            a(f'<tr><td>MCL</td><td class="num">{mcl:+.1f}</td>'
-              f'<td class="num" style="color:#64748b">{st}'
-              f'（EMA19−EMA39）</td></tr>')
+            a('<tr><td>20日背离</td><td class="num">样本不足</td>'
+              '<td class="num" style="color:#64748b">需 21 天历史</td></tr>')
         a('</table></div>')
 
     # 六项打分
@@ -979,10 +1076,18 @@ def main():
         v, d = technical_vote_from(h["code"], q.get("price"), today)
         hold_tech[h["code"]] = (v, d)
 
+    # 广度和指数背离（20 日）
+    idx_rows = fetch_daily("sh000001", 120)
+    live_idx = (indexes.get("sh000001") or {}).get("price")
+    if live_idx:
+        idx_rows = [r for r in idx_rows if r[0] != today] + [(today, live_idx)]
+    div = detect_divergence(hist, idx_rows, lookback=20)
+
     extras = {
         "fund_vote": fund_vote, "tech_vote": tech_vote,
         "final_vote": final_vote, "final_reason": final_reason,
         "tech_detail": tech_detail, "trend": trend, "hold_tech": hold_tech,
+        "divergence": div,
     }
 
     if args.json_path:
