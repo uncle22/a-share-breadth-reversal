@@ -68,9 +68,9 @@ EM_URL = ("https://push2.eastmoney.com/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1
           "&fields=f2,f3,f5,f6,f12,f14")
 
 DEFAULT_HOLDINGS = [
-    {"code": "sh515880", "name": "通信ETF",    "qty": 0, "cost": 0.0},
-    {"code": "sz159516", "name": "半导体设备",  "qty": 0,  "cost": 0.0},
-    {"code": "sh601328", "name": "交通银行",    "qty": 0,  "cost": 0.0},
+    {"code": "sh515880", "name": "通信ETF",    "qty": 76300, "cost": 0.8370},
+    {"code": "sz159516", "name": "半导体设备",  "qty": 7000,  "cost": 0.9887},
+    {"code": "sh601328", "name": "交通银行",    "qty": 1000,  "cost": 6.8789},
     {"code": "sh512800", "name": "银行ETF",     "qty": 0,     "cost": 0.0},
 ]
 
@@ -180,6 +180,105 @@ def market_progress(now):
     return 1.0
 
 
+KLINE_URL = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+             "?param={code},day,,,{n},qfq")
+
+
+def fetch_daily(code, n=80):
+    """返回 [(date_str, close), ...]，日期升序。失败返回 []。"""
+    try:
+        raw = http_get(KLINE_URL.format(code=code, n=n), timeout=20,
+                       referer="https://gu.qq.com/")
+        js = json.loads(raw.decode("utf-8", "ignore"))
+        d = (js.get("data") or {}).get(code) or {}
+        arr = d.get("qfqday") or d.get("day") or []
+        out = []
+        for x in arr:
+            if len(x) >= 3:
+                try:
+                    out.append((str(x[0]), float(x[2])))
+                except Exception:
+                    continue
+        return out
+    except Exception:
+        return []
+
+
+def ma(seq, n):
+    if seq is None or len(seq) < n:
+        return None
+    return sum(seq[-n:]) / n
+
+
+def ema(seq, n):
+    if seq is None or len(seq) < n:
+        return None
+    k = 2.0 / (n + 1)
+    e = sum(seq[:n]) / float(n)
+    for x in seq[n:]:
+        e = x * k + e * (1 - k)
+    return e
+
+
+def technical_vote_from(code, live_price, today):
+    """日线技术面票：多 / 空 / 中。
+
+    规则（写死、可复现）：
+      收盘 > MA20 且 MA5 > MA10  -> 多
+      收盘 < MA20 且 MA5 < MA10  -> 空
+      其他                        -> 中
+    """
+    rows = fetch_daily(code, 80)
+    if not rows:
+        return "中", {"ma5": None, "ma10": None, "ma20": None, "px": live_price,
+                      "note": "K线拉取失败"}
+    closes = [c for d, c in rows if d != today]
+    if not closes:
+        closes = [c for _d, c in rows]
+    px = live_price if live_price else (closes[-1] if closes else None)
+    if px is None:
+        return "中", {"ma5": None, "ma10": None, "ma20": None, "px": None,
+                      "note": "价格缺失"}
+    s = list(closes) + [px]
+    m5, m10, m20 = ma(s, 5), ma(s, 10), ma(s, 20)
+    if None in (m5, m10, m20):
+        return "中", {"ma5": m5, "ma10": m10, "ma20": m20, "px": px,
+                      "note": "均线样本不足"}
+    if px > m20 and m5 > m10:
+        v = "多"
+    elif px < m20 and m5 < m10:
+        v = "空"
+    else:
+        v = "中"
+    return v, {"ma5": m5, "ma10": m10, "ma20": m20, "px": px, "note": ""}
+
+
+def fund_vote_from_score(total):
+    """资金面票：0-4 空 / 5-8 中 / 9-12 多。"""
+    if total <= 4:
+        return "空"
+    if total <= 8:
+        return "中"
+    return "多"
+
+
+def combine_votes(fund, tech):
+    """两票制：同向则执行；冲突则「准备X，等」。"""
+    if fund == tech:
+        if fund == "多":
+            return "多", "同向多 → 可按计划加/持有"
+        if fund == "空":
+            return "空", "同向空 → 不加仓，占比高的减"
+        return "中", "双中性 → 不动"
+    if fund == "中":
+        return tech, f"资金中性 → 跟随技术面（{tech}）"
+    if tech == "中":
+        return fund, f"技术中性 → 跟随资金面（{fund}）"
+    # 冲突：一多一空
+    wait_side = "空" if fund == "空" else "多"
+    return "等", f"冲突（资金{fund} / 技术{tech}）→ 准备{wait_side}，等两边同向"
+
+
 def compute_breadth(rows):
     up = down = flat = 0
     amt_total = amt_up = vol_total = vol_up = 0.0
@@ -283,6 +382,24 @@ def full_day_avg(hist, n=5):
     return sum(vals) / len(vals)
 
 
+def compute_trend(hist):
+    """10 日 TRIN 均线 + MCL（McClellan Oscillator = EMA19(AD) − EMA39(AD)）。"""
+    trin = [h.get("trin_amt") for h in hist if h.get("trin_amt") is not None]
+    trin_ma10 = (sum(trin[-10:]) / 10.0) if len(trin) >= 10 else None
+
+    ad = []
+    for h in hist:
+        if h.get("up") is not None and h.get("down") is not None:
+            ad.append(h["up"] - h["down"])
+    mcl = None
+    if len(ad) >= 40:
+        e19, e39 = ema(ad, 19), ema(ad, 39)
+        if e19 is not None and e39 is not None:
+            mcl = e19 - e39
+    return {"trin_ma10": trin_ma10, "mcl": mcl,
+            "trin_n": len(trin), "ad_n": len(ad)}
+
+
 # ---------------------------------------------------------------- 打分
 
 def score_all(ind, hist, progress=1.0):
@@ -379,7 +496,7 @@ def score_all(ind, hist, progress=1.0):
 
 def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
                  quotes, indexes, holdings, stamp, sample_n, total_stocks,
-                 cash=0.0, progress=1.0):
+                 cash=0.0, progress=1.0, extras=None):
     L = []
     w = L.append
     w("═" * 52)
@@ -470,7 +587,41 @@ def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
                 w("  ✅ 单一持仓占比 <30%，可以等「真反转」再加仓。")
         w("")
 
-    w("【六、结论】")
+    ex = extras or {}
+    if ex.get("fund_vote"):
+        fd = ex["tech_detail"] or {}
+        w("【六、两票制】（资金面为大，技术面为小）")
+        w(f"  资金面票  {ex['fund_vote']:<2}   （广度 {total}/12）")
+        ma5, ma10, ma20 = fd.get("ma5"), fd.get("ma10"), fd.get("ma20")
+        fmt = lambda x: "n/a" if x is None else f"{x:,.2f}"
+        w(f"  技术面票  {ex['tech_vote']:<2}   （上证 {fmt(fd.get('px'))} | "
+          f"MA5 {fmt(ma5)} / MA10 {fmt(ma10)} / MA20 {fmt(ma20)}）")
+        fv = ex["final_vote"]
+        mark = {"多": "🟢", "空": "🔴", "中": "⚪", "等": "⏸"}.get(fv, "⚪")
+        w(f"  合  并    {mark} {fv}")
+        w(f"  → {ex['final_reason']}")
+        if fv == "等":
+            w("  按「冲突则等」的纪律：今天不开新仓，等两边同向再动。")
+        w("")
+
+    tr = ex.get("trend") or {}
+    if tr:
+        w("【七、趋势指标】")
+        t10 = tr.get("trin_ma10")
+        if t10 is None:
+            w(f"  10日 TRIN  样本不足（需 10 天，现有 {tr.get('trin_n', 0)} 天）")
+        else:
+            state = "超买" if t10 < 0.8 else ("超卖" if t10 > 1.2 else "中性")
+            w(f"  10日 TRIN  {t10:.2f}  （{state}；<0.8 超买 / >1.2 超卖）")
+        mcl = tr.get("mcl")
+        if mcl is None:
+            w(f"  MCL        样本不足（需 39 天，现有 {tr.get('ad_n', 0)} 天）")
+        else:
+            state = "广度强" if mcl > 0 else "广度弱"
+            w(f"  MCL        {mcl:+.1f}  （{state}；= EMA19−EMA39 的涨跌差）")
+        w("")
+
+    w("【八、结论】")
     if ind["up_ratio"] < 0.25 and ind["gap_amt"] > 15:
         w("  ⚠ 极致分化：涨家占比 <25% 但涨额占比明显偏高，"
           "指数被少数权重/题材拉着，多数股票在跌。")
@@ -530,7 +681,7 @@ def _spark(hist, key, w=560, h=90, color="#60a5fa"):
 
 def render_html(ind, hist, total, verdict, tag, items, amount_mult, streak,
                 quotes, indexes, holdings, stamp, sample_n, total_stocks,
-                cash=0.0, progress=1.0):
+                cash=0.0, progress=1.0, extras=None):
     color = TAG_COLOR.get(tag, "#94a3b8")
     P = []
     a = P.append
@@ -610,6 +761,59 @@ def render_html(ind, hist, total, verdict, tag, items, amount_mult, streak,
         a('<div class="warn">盘中数据：量能按交易进度线性折算，'
           '误差约 ±10%；14:45 后最准。</div>')
     a('</div></div>')
+
+    # 两票制
+    ex = extras or {}
+    if ex.get("fund_vote"):
+        fv = ex["final_vote"]
+        vc = {"多": "#22c55e", "空": "#ef4444", "中": "#94a3b8",
+              "等": "#eab308"}.get(fv, "#94a3b8")
+        a('<div class="panel"><h2>两票制 · 资金面为大，技术面为小</h2>')
+        a('<table>')
+        a(f'<tr><td>资金面票</td><td class="num">'
+          f'<b style="font-size:17px">{ex["fund_vote"]}</b></td>'
+          f'<td class="num" style="color:#64748b">广度 {total}/12</td></tr>')
+        fd = ex.get("tech_detail") or {}
+        fmt = lambda x: "n/a" if x is None else f"{x:,.2f}"
+        a(f'<tr><td>技术面票</td><td class="num">'
+          f'<b style="font-size:17px">{ex["tech_vote"]}</b></td>'
+          f'<td class="num" style="color:#64748b">上证 {fmt(fd.get("px"))} · '
+          f'MA5 {fmt(fd.get("ma5"))} / MA20 {fmt(fd.get("ma20"))}</td></tr>')
+        a(f'<tr><td><b>合并</b></td><td class="num">'
+          f'<b style="font-size:20px;color:{vc}">{fv}</b></td>'
+          f'<td class="num" style="color:#64748b">{_esc(ex["final_reason"])}'
+          f'</td></tr>')
+        a('</table>')
+        if fv == "等":
+            a('<div class="warn">⏸ 冲突 → 准备X，等。今天不开新仓，'
+              '等资金面与技术面同向再动。</div>')
+        a('</div>')
+
+    # 趋势指标
+    tr = ex.get("trend") or {}
+    if tr:
+        a('<div class="panel"><h2>趋势指标</h2><table>')
+        t10 = tr.get("trin_ma10")
+        if t10 is None:
+            a(f'<tr><td>10日 TRIN</td><td class="num">样本不足</td>'
+              f'<td class="num" style="color:#64748b">需 10 天，现有 '
+              f'{tr.get("trin_n", 0)} 天</td></tr>')
+        else:
+            st = "超买" if t10 < 0.8 else ("超卖" if t10 > 1.2 else "中性")
+            a(f'<tr><td>10日 TRIN</td><td class="num">{t10:.2f}</td>'
+              f'<td class="num" style="color:#64748b">{st}'
+              f'（&lt;0.8 超买 / &gt;1.2 超卖）</td></tr>')
+        mcl = tr.get("mcl")
+        if mcl is None:
+            a(f'<tr><td>MCL</td><td class="num">样本不足</td>'
+              f'<td class="num" style="color:#64748b">需 39 天，现有 '
+              f'{tr.get("ad_n", 0)} 天</td></tr>')
+        else:
+            st = "广度强" if mcl > 0 else "广度弱"
+            a(f'<tr><td>MCL</td><td class="num">{mcl:+.1f}</td>'
+              f'<td class="num" style="color:#64748b">{st}'
+              f'（EMA19−EMA39）</td></tr>')
+        a('</table></div>')
 
     # 六项打分
     a('<div class="panel"><h2>六项打分</h2><table>')
@@ -759,6 +963,28 @@ def main():
     hist.sort(key=lambda h: h.get("date", ""))
     save_history(hist)
 
+    # ---- 两票制（资金面 / 技术面）+ 趋势指标 ----
+    trend = compute_trend(hist)
+    idx_q = indexes.get("sh000001") or {}
+    tech_vote, tech_detail = technical_vote_from("sh000001",
+                                                 idx_q.get("price"), today)
+    fund_vote = fund_vote_from_score(total)
+    final_vote, final_reason = combine_votes(fund_vote, tech_vote)
+
+    hold_tech = {}
+    for h in holdings:
+        if not h.get("qty"):
+            continue
+        q = quotes.get(h["code"]) or {}
+        v, d = technical_vote_from(h["code"], q.get("price"), today)
+        hold_tech[h["code"]] = (v, d)
+
+    extras = {
+        "fund_vote": fund_vote, "tech_vote": tech_vote,
+        "final_vote": final_vote, "final_reason": final_reason,
+        "tech_detail": tech_detail, "trend": trend, "hold_tech": hold_tech,
+    }
+
     if args.json_path:
         with open(args.json_path, "w", encoding="utf-8") as f:
             json.dump({"record": rec, "history": hist}, f, ensure_ascii=False, indent=1)
@@ -770,7 +996,7 @@ def main():
                 f.write(render_html(ind, hist[:-1], total, verdict, tag, items,
                                     amount_mult, streak, quotes, indexes,
                                     holdings, stamp, sample_n, total_stocks,
-                                    cash, progress))
+                                    cash, progress, extras))
             print(f"[html] {hp}")
         except Exception as e:
             print(f"[html] 生成失败: {e}")
@@ -782,7 +1008,7 @@ def main():
 
     report = build_report(ind, hist[:-1], total, verdict, tag, items, amount_mult,
                           streak, quotes, indexes, holdings, stamp, sample_n,
-                          total_stocks, cash, progress)
+                          total_stocks, cash, progress, extras)
     print(report)
 
 
