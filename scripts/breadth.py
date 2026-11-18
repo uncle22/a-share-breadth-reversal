@@ -68,9 +68,9 @@ EM_URL = ("https://push2.eastmoney.com/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1
           "&fields=f2,f3,f5,f6,f12,f14")
 
 DEFAULT_HOLDINGS = [
-    {"code": "sh515880", "name": "通信ETF",    "qty": 76300, "cost": 0.8370},
-    {"code": "sz159516", "name": "半导体设备",  "qty": 7000,  "cost": 0.9887},
-    {"code": "sh601328", "name": "交通银行",    "qty": 1000,  "cost": 6.8789},
+    {"code": "sh515880", "name": "通信ETF",    "qty": 0, "cost": 0.0},
+    {"code": "sz159516", "name": "半导体设备",  "qty": 0,  "cost": 0.0},
+    {"code": "sh601328", "name": "交通银行",    "qty": 0,  "cost": 0.0},
     {"code": "sh512800", "name": "银行ETF",     "qty": 0,     "cost": 0.0},
 ]
 
