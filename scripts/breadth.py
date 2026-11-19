@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -63,9 +64,9 @@ HOLD_PATH = os.path.join(DATA, "holdings.json")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
-EM_URL = ("https://push2.eastmoney.com/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1"
-          "&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-          "&fields=f2,f3,f5,f6,f12,f14")
+# 全A样本池（不含北交所/B股）
+EM_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+EM_FIELDS = "f2,f3,f5,f6,f12,f14"
 
 DEFAULT_HOLDINGS = [
     {"code": "sh515880", "name": "通信ETF",    "qty": 76300, "cost": 0.8370},
@@ -79,15 +80,57 @@ INDEXES = [("sh000001", "上证"), ("sz399006", "创业板"), ("sh000688", "科�
 
 # ---------------------------------------------------------------- http
 
-def http_get(url, timeout=15, referer="https://quote.eastmoney.com/"):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": referer})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+# 东财有多个反代/镜像域名，主站被限流或抽风时轮流试。
+# 实测 2026-11：主站 https 常被 RemoteDisconnected，http 的 push2delay 最稳
+# （首次几发 503，之后正常）。
+EM_HOSTS = [
+    "http://push2delay.eastmoney.com",
+    "https://push2.eastmoney.com",
+    "https://push2delay.eastmoney.com",
+]
+_EM_HOST_IDX = [0]
+
+
+def http_get(url, timeout=15, referer="https://quote.eastmoney.com/",
+             retries=4, backoff=1.2):
+    """带重试的 GET。失败时按 backoff 递增退避重试。"""
+    last = None
+    for i in range(max(1, retries)):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": UA, "Referer": referer})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last = e
+            if i < retries - 1:
+                time.sleep(backoff * (1.5 ** i))
+    raise last
+
+
+def em_get(path, timeout=20):
+    """按域名轮换打东财接口。当前域名失败就换下一个。"""
+    n = len(EM_HOSTS)
+    start = _EM_HOST_IDX[0]
+    err = None
+    for k in range(n):
+        host = EM_HOSTS[(start + k) % n]
+        try:
+            raw = http_get(host + path, timeout=timeout, retries=4, backoff=1.2)
+            _EM_HOST_IDX[0] = (start + k) % n      # 记住能用的那个
+            return raw
+        except Exception as e:
+            err = e
+            continue
+    raise err if err else RuntimeError("东财全部域名不可用")
 
 
 def fetch_page(pn):
+    inp = f"&invt=2&fltt=2&invt=2&fid=f3&fs={EM_FS}"
+    url = (f"/api/qt/clist/get?pn={pn}&pz=100&po=1&np=1{inp}"
+           f"&fields={EM_FIELDS}")
     try:
-        raw = http_get(EM_URL.format(pn=pn))
+        raw = em_get(url)
         js = json.loads(raw.decode("utf-8", "ignore"))
         d = js.get("data")
         if not d:
@@ -100,11 +143,13 @@ def fetch_page(pn):
 def fetch_all_a():
     total, first = fetch_page(1)
     if not first:
-        raise RuntimeError("东财全A快照拉取失败（第1页为空）")
+        raise RuntimeError(
+            "全A快照拉取失败：东财主站与镜像均不可用。"
+            "常见原因：请求过频被限流（等 2-5 分钟再试），或接口临时故障。")
     pages = max(1, (total + 99) // 100)
     rows = list(first)
     if pages > 1:
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=6) as ex:
             for _t, batch in ex.map(fetch_page, range(2, pages + 1)):
                 rows.extend(batch)
     seen, uniq = set(), []
@@ -324,6 +369,20 @@ def compute_breadth(rows):
     trin_amt = (up / down) / (amt_up / amt_dn) if (down and amt_dn and amt_up) else None
     trin_vol = (up / down) / (vol_up / vol_dn) if (down and vol_dn and vol_up) else None
 
+    # 成交前十集中度：前 10 名成交额 ÷ 全市场成交额
+    amts = []
+    for r in rows:
+        try:
+            amts.append(float(r.get("f6") or 0))
+        except Exception:
+            pass
+    amts.sort(reverse=True)
+    top10 = sum(amts[:10])
+    top10_conc = (top10 / amt_total * 100.0) if amt_total else None
+    # 均匀分布下的集中度 = 10 / 家数，用它算「倍数」
+    uniform = (10.0 / valid * 100.0) if valid else None
+    top10_x = (top10_conc / uniform) if (top10_conc and uniform) else None
+
     return {
         "up": up, "down": down, "flat": flat, "valid": valid,
         "up_ratio": up_ratio,
@@ -336,6 +395,8 @@ def compute_breadth(rows):
         "limit_up": lim_up,
         "limit_down": lim_dn,
         "amount_yi": amt_total / 1e8,
+        "top10_conc": top10_conc,
+        "top10_x": top10_x,
     }
 
 
@@ -523,7 +584,7 @@ def score_all(ind, hist, progress=1.0):
         items.append(("涨停/跌停", f"{lu}/{ld}", 0, "跌停多，情绪差"))
 
     avg5 = full_day_avg(hist, 5)
-    if avg5 and progress > 0.10:
+    if avg5 and progress >= 0.50:
         equiv = ind["amount_yi"] / progress
         mult = equiv / avg5
         if mult >= 1.10:
@@ -533,6 +594,10 @@ def score_all(ind, hist, progress=1.0):
         else:
             items.append(("成交额/5日均", f"×{mult:.2f}", 0, "缩量=假反弹"))
         amount_mult = mult
+    elif avg5:
+        # 开盘前半小时成交量天然占全天比例偏高，线性外推会严重高估
+        items.append(("成交额/5日均", "过早", 1, "进度<50%，暂不折算"))
+        amount_mult = None
     else:
         items.append(("成交额/5日均", "样本不足", 1, "首次运行，按中性"))
         amount_mult = None
@@ -583,6 +648,12 @@ def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
     ta = f"{ind['trin_amt']:.2f}" if ind['trin_amt'] is not None else "n/a"
     tv = f"{ind['trin_vol']:.2f}" if ind['trin_vol'] is not None else "n/a"
     w(f"  TRIN_额 {ta}      TRIN_量 {tv}")
+    tc = ind.get("top10_conc")
+    tx = ind.get("top10_x")
+    if tc is not None:
+        xt = f"（均匀分布的 {tx:.0f} 倍）" if tx else ""
+        warn = "，盘中偏高、收盘才可比" if progress < 0.90 else ""
+        w(f"  成交前十集中度 {tc:.2f}%{xt}{warn}")
     w(f"  涨停 {ind['limit_up']} / 跌停 {ind['limit_down']}")
     pct_txt = f"交易进度 {progress*100:.0f}%"
     if amount_mult:
@@ -659,6 +730,24 @@ def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
         w("")
 
     ex = extras or {}
+    wl = ex.get("watch") or []
+    if wl:
+        w("【五之二、关注标的（不计入我的占比）】")
+        for x in wl:
+            q = quotes.get(x.get("code"))
+            if not q:
+                continue
+            qty = x.get("qty") or 0
+            cost = x.get("cost") or 0
+            pnl = ((q["price"] / cost - 1) * 100) if cost else None
+            mv = qty * q["price"]
+            pnl_txt = f"{pnl:+.1f}%" if pnl is not None else "-"
+            nm = x.get("name") or q["name"]
+            w(f"  {nm:<10} {q['price']:.3f}  {q['pct']:+.2f}%  "
+              f"{qty:,}股  {mv:,.0f}元  成本{cost:.3f}  盈亏{pnl_txt}")
+            if x.get("note"):
+                w(f"      备注：{x['note']}")
+        w("")
     if ex.get("fund_vote"):
         fd = ex["tech_detail"] or {}
         w("【六、两票制】（资金面为大，技术面为小）")
@@ -721,6 +810,17 @@ def build_report(ind, hist, total, verdict, tag, items, amount_mult, streak,
         w("")
 
     w("【八、结论】")
+    # 护盘式假红盘：指数红 + 多数股票跌 + 涨的都是大票
+    sh = indexes.get("sh000001") or {}
+    sh_pct = sh.get("pct")
+    if (sh_pct is not None and sh_pct > 0
+            and ind["up_ratio"] < 0.25 and ind["gap_amt"] > 20):
+        lose = (1 - ind["up_ratio"]) * 100
+        w(f"  🚨 护盘式假红盘：上证 {sh_pct:+.2f}%（红），但涨家只 "
+          f"{ind['up_ratio']*100:.1f}%、额价差 {ind['gap_amt']:+.1f}pp。")
+        w(f"     意思是：{lose:.0f}% 的股票在跌，资金在强行拉指数。")
+        w("     这不是反弹，是「指数体面、账户难看」。")
+        w("")
     if ind["up_ratio"] < 0.25 and ind["gap_amt"] > 15:
         w("  ⚠ 极致分化：涨家占比 <25% 但涨额占比明显偏高，"
           "指数被少数权重/题材拉着，多数股票在跌。")
@@ -831,7 +931,7 @@ def render_html(ind, hist, total, verdict, tag, items, amount_mult, streak,
 
     # 大数字
     a('<div class="grid">')
-    for k, v, n in [
+    cards = [
         ("涨家占比", f"{ind['up_ratio']*100:.1f}%", f"{ind['up']:,} 涨 / "
          f"{ind['down']:,} 跌"),
         ("额价差", f"{ind['gap_amt']:+.1f}pp", "涨额占比−涨家占比"),
@@ -842,7 +942,12 @@ def render_html(ind, hist, total, verdict, tag, items, amount_mult, streak,
         ("全A成交额", f"{ind['amount_yi']:,.0f}亿",
          f"进度{progress*100:.0f}%" + (f" · ×{amount_mult:.2f}"
                                        if amount_mult else "")),
-    ]:
+    ]
+    if ind.get("top10_conc") is not None:
+        tx = ind.get("top10_x")
+        cards.insert(3, ("成交前十集中度", f"{ind['top10_conc']:.2f}%",
+                         f"均匀分布的 {tx:.0f} 倍" if tx else "前10÷全场"))
+    for k, v, n in cards:
         a(f'<div class="card"><div class="k">{k}</div>'
           f'<div class="v">{v}</div><div class="n">{n}</div></div>')
     a('</div>')
@@ -853,6 +958,18 @@ def render_html(ind, hist, total, verdict, tag, items, amount_mult, streak,
       f'<span style="color:#64748b;font-size:13px"> · {total}/12 分</span>')
     a('<div class="bar">')
     a(f'<i style="width:{total/12*100:.0f}%;background:{color}"></i></div>')
+    sh = indexes.get("sh000001") or {}
+    sh_pct = sh.get("pct")
+    if (sh_pct is not None and sh_pct > 0
+            and ind["up_ratio"] < 0.25 and ind["gap_amt"] > 20):
+        lose = (1 - ind["up_ratio"]) * 100
+        a(f'<div style="border-left:3px solid #ef4444;padding:10px 14px;'
+          f'background:#2a1215;border-radius:0 8px 8px 0;margin-top:12px">'
+          f'<b style="color:#ef4444">🚨 护盘式假红盘</b>'
+          f'<div style="color:#fca5a5;font-size:13px;margin-top:6px">'
+          f'上证 {sh_pct:+.2f}%（红），但涨家只 {ind["up_ratio"]*100:.1f}%、'
+          f'额价差 {ind["gap_amt"]:+.1f}pp。{lose:.0f}% 的股票在跌，'
+          f'资金在强行拉指数。这不是反弹。</div></div>')
     if ind["up_ratio"] < 0.25 and ind["gap_amt"] > 15:
         a('<div class="warn">⚠ 极致分化：涨家 &lt;25% 但涨额偏高，'
           '指数被少数权重/题材拉着。这种行情里「指数红」不等于「你的票红」。</div>')
@@ -1048,6 +1165,7 @@ def main():
     # 报价
     indexes = fetch_quotes([c for c, _ in INDEXES])
     quotes, holdings, cash = {}, [], 0.0
+    watch = []
     if not args.no_holdings:
         holdings = list(DEFAULT_HOLDINGS)
         if os.path.exists(HOLD_PATH):
@@ -1058,11 +1176,14 @@ def main():
                     if isinstance(hh.get("list"), list) and hh["list"]:
                         holdings = hh["list"]
                     cash = float(hh.get("cash") or 0)
+                    if isinstance(hh.get("watch"), list):
+                        watch = hh["watch"]
                 elif isinstance(hh, list) and hh:
                     holdings = hh
             except Exception:
                 pass
-        quotes = fetch_quotes([h["code"] for h in holdings])
+        quotes = fetch_quotes(
+            [h["code"] for h in holdings] + [w["code"] for w in watch])
 
     rec = {
         "date": today,
@@ -1114,7 +1235,7 @@ def main():
         "fund_vote": fund_vote, "tech_vote": tech_vote,
         "final_vote": final_vote, "final_reason": final_reason,
         "tech_detail": tech_detail, "trend": trend, "hold_tech": hold_tech,
-        "divergence": div,
+        "divergence": div, "watch": watch,
     }
 
     if args.json_path:
